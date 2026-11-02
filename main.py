@@ -1,5 +1,15 @@
-import os import json import asyncio import logging
-from aiohttp import web from aiogram import Bot, Dispatcher, types from aiogram.filters import Command from aiogram.webhook.aiohttp_server import ( SimpleRequestHandler, setup_application, )
+import os
+import json
+import asyncio
+import logging
+from aiohttp
+import web
+from aiogram
+import Bot, Dispatcher, types
+from aiogram.filters
+import Command
+from aiogram.webhook.aiohttp_server
+import ( SimpleRequestHandler, setup_application, )
 logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.environ["BOT_TOKEN"] OWNER_ID = int(os.environ["OWNER_ID"]) WEBHOOK_URL = os.environ["WEBHOOK_URL"].rstrip("/") WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 WEBHOOK_PATH = "/webhook" INTERVAL = 1800 DATA_FILE = "/tmp/bot_data.json"
