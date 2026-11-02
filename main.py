@@ -128,6 +128,7 @@ def default_state():
     return {
         "groups": {},  # "chat_id" -> {"title": "..."}
         "post_text": "",
+        "post_source": None,  # {"chat_id": ..., "message_id": ...} - сообщение для пересылки
         "autopost_enabled": False,
         "interval_min": DEFAULT_INTERVAL_MIN,
         "last_post_ts": 0.0,
@@ -148,6 +149,15 @@ def apply_loaded(data):
             title = value.get("title") if isinstance(value, dict) else None
             new["groups"][str(key)] = {"title": str(title or key)}
     new["post_text"] = str(data.get("post_text", ""))
+    source = data.get("post_source")
+    if isinstance(source, dict):
+        try:
+            new["post_source"] = {
+                "chat_id": int(source["chat_id"]),
+                "message_id": int(source["message_id"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            new["post_source"] = None
     new["autopost_enabled"] = bool(data.get("autopost_enabled", False))
     try:
         interval = int(data.get("interval_min", DEFAULT_INTERVAL_MIN))
@@ -261,6 +271,18 @@ def group_title(key):
     return group["title"] if group else str(key)
 
 
+def has_post():
+    return bool(state["post_source"] or state["post_text"])
+
+
+def post_description():
+    if state["post_source"]:
+        return "пересылаемое сообщение"
+    if state["post_text"]:
+        return f"текст, {len(state['post_text'])} символов"
+    return "не задан"
+
+
 def next_due_ts():
     return state["last_post_ts"] + state["interval_min"] * 60
 
@@ -321,13 +343,26 @@ async def migrate_group(old_id, new_id):
         log.info("Группа %s переехала на id %s", old_id, new_id)
 
 
-async def send_one(chat_id, text):
+async def deliver(chat_id):
+    """Пересылает сохранённое сообщение или отправляет сохранённый текст."""
+    source = state["post_source"]
+    if source:
+        await bot.forward_message(
+            chat_id=chat_id,
+            from_chat_id=source["chat_id"],
+            message_id=source["message_id"],
+        )
+    else:
+        await bot.send_message(chat_id, state["post_text"])
+
+
+async def send_one(chat_id):
     """Возвращает (статус, пояснение): ok / failed / removed."""
     key = str(chat_id)
     title = group_title(key)
     for attempt in range(3):
         try:
-            await bot.send_message(chat_id, text)
+            await deliver(chat_id)
             return "ok", ""
         except TelegramRetryAfter as exc:
             if attempt < 2 and exc.retry_after <= 60:
@@ -343,7 +378,13 @@ async def send_one(chat_id, text):
             state["groups"].pop(key, None)
             return "removed", describe_error(exc)
         except TelegramBadRequest as exc:
-            if "chat not found" in (exc.message or "").lower():
+            lowered = (exc.message or "").lower()
+            if "message to forward not found" in lowered or "can't be forwarded" in lowered:
+                return "failed", (
+                    "исходный пост удалён или его нельзя пересылать - "
+                    "задайте пост заново через /setpost"
+                )
+            if "chat not found" in lowered:
                 state["groups"].pop(key, None)
                 return "removed", "группа не найдена (бот удалён или группа закрыта)"
             return "failed", describe_error(exc)
@@ -356,12 +397,11 @@ async def send_one(chat_id, text):
 async def publish_to_groups(source, late_min=0):
     """Публикует текст во все группы. Возвращает словарь с итогами."""
     async with publish_lock:
-        text = state["post_text"]
         keys = list(state["groups"])
         result = {"ok": 0, "total": len(keys), "failed": [], "removed": []}
         for index, key in enumerate(keys):
             title = group_title(key)
-            status, detail = await send_one(int(key), text)
+            status, detail = await send_one(int(key))
             if status == "ok":
                 result["ok"] += 1
             elif status == "removed":
@@ -393,11 +433,11 @@ def format_result(result):
 
 
 async def run_autopost():
-    if not state["post_text"] or not state["groups"]:
+    if not has_post() or not state["groups"]:
         state["autopost_enabled"] = False
         await save_state()
         await notify_owner(
-            "⏸ Автопубликация выключена: нет текста или нет групп. "
+            "⏸ Автопубликация выключена: нет поста или нет групп. "
             "Задайте /setpost, добавьте группу через /addhere и включите /autopost_on."
         )
         return
@@ -435,8 +475,9 @@ async def scheduler():
 # ---------------------------------------------------------------------------
 
 HELP_TEXT = (
-    "/setpost Текст - задать текст публикации\n"
-    "/showpost - показать текущий текст\n"
+    "/setpost - ответьте этой командой на готовое сообщение, и я буду пересылать его в группы\n"
+    "/setpost Текст - или задайте обычный текст\n"
+    "/showpost - показать текущий пост\n"
     "/addhere - добавить группу (отправить в самой группе)\n"
     "/groups - список групп\n"
     "/removegroup N - убрать группу (N из /groups)\n"
@@ -467,8 +508,23 @@ async def set_post(message: types.Message, command: CommandObject):
     if not await guard(message):
         return
     text = (command.args or "").strip()
+    reply = message.reply_to_message
+    if reply is not None and not text:
+        state["post_source"] = {"chat_id": reply.chat.id, "message_id": reply.message_id}
+        state["post_text"] = ""
+        ok = await save_state()
+        await message.answer(
+            "Пост сохранён: буду пересылать именно это сообщение. "
+            "Не удаляйте его из этого чата. Проверить: /showpost." + save_note(ok)
+        )
+        return
     if not text:
-        await message.answer("Использование: /setpost Текст публикации")
+        await message.answer(
+            "Как задать пост:\n"
+            "1) отправьте мне готовое сообщение (или перешлите пост из канала) "
+            "и ответьте на него командой /setpost;\n"
+            "2) или обычным текстом: /setpost Текст публикации"
+        )
         return
     if len(text) > MAX_POST_LEN:
         await message.answer(
@@ -476,6 +532,7 @@ async def set_post(message: types.Message, command: CommandObject):
         )
         return
     state["post_text"] = text
+    state["post_source"] = None
     ok = await save_state()
     await message.answer(f"Текст публикации сохранён ({len(text)} символов)." + save_note(ok))
 
@@ -484,8 +541,23 @@ async def set_post(message: types.Message, command: CommandObject):
 async def show_post(message: types.Message):
     if not await guard(message):
         return
+    source = state["post_source"]
+    if source:
+        try:
+            await bot.forward_message(
+                chat_id=message.chat.id,
+                from_chat_id=source["chat_id"],
+                message_id=source["message_id"],
+            )
+        except Exception:
+            log.exception("Не удалось показать сохранённый пост")
+            await message.answer(
+                "Не получилось показать пост: исходное сообщение, похоже, удалено. "
+                "Задайте пост заново через /setpost."
+            )
+        return
     if not state["post_text"]:
-        await message.answer("Текст пока не задан. Используйте /setpost.")
+        await message.answer("Пост пока не задан. Используйте /setpost.")
         return
     await message.answer("Текущий текст публикации:\n\n" + state["post_text"])
 
@@ -556,8 +628,8 @@ async def remove_group_command(message: types.Message, command: CommandObject):
 async def publish_now(message: types.Message):
     if not await guard(message):
         return
-    if not state["post_text"]:
-        await message.answer("Сначала задайте текст через /setpost.")
+    if not has_post():
+        await message.answer("Сначала задайте пост через /setpost.")
         return
     if not state["groups"]:
         await message.answer("Сначала добавьте группы через /addhere.")
@@ -571,8 +643,8 @@ async def publish_now(message: types.Message):
 async def autopost_on(message: types.Message):
     if not await guard(message):
         return
-    if not state["post_text"] or not state["groups"]:
-        await message.answer("Сначала задайте текст через /setpost и добавьте группы через /addhere.")
+    if not has_post() or not state["groups"]:
+        await message.answer("Сначала задайте пост через /setpost и добавьте группы через /addhere.")
         return
     state["autopost_enabled"] = True
     state["last_post_ts"] = time.time()
@@ -634,8 +706,7 @@ def status_text():
     if storage_error:
         lines.append(f"Ошибка хранилища: {storage_error}")
     lines.append(f"Групп: {len(state['groups'])}")
-    post = state["post_text"]
-    lines.append(f"Текст: {'задан, ' + str(len(post)) + ' символов' if post else 'не задан'}")
+    lines.append(f"Пост: {post_description()}")
     if state["autopost_enabled"]:
         lines.append(f"Автопубликация: включена, каждые {state['interval_min']} мин")
         wait = next_due_ts() - now
