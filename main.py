@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import signal
 import time
@@ -17,6 +18,16 @@ from aiogram.exceptions import (
 )
 from aiogram.filters import Command, CommandObject
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+
+try:
+    from telethon import TelegramClient
+    from telethon import utils as tl_utils
+    from telethon.sessions import StringSession
+    from telethon.tl.functions.messages import CheckChatInviteRequest
+    from telethon.tl.types import ChatInviteAlready
+except ImportError:  # telethon нужен только для публикации от аккаунта
+    TelegramClient = tl_utils = StringSession = None
+    CheckChatInviteRequest = ChatInviteAlready = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,6 +94,26 @@ if not BASE_URL:
 elif not BASE_URL.startswith("https://"):
     _problems.append("WEBHOOK_URL должен начинаться с https://")
 
+# Публикация от отдельного пользовательского аккаунта (необязательно).
+TG_API_ID = 0
+TG_API_HASH = env_str("TG_API_HASH")
+TG_SESSION = env_str("TG_SESSION")
+ACCOUNT_MODE = False
+_api_id_raw = env_str("TG_API_ID")
+if _api_id_raw or TG_API_HASH or TG_SESSION:
+    if not (_api_id_raw and TG_API_HASH and TG_SESSION):
+        _problems.append(
+            "Для публикации от аккаунта нужны все три переменные: "
+            "TG_API_ID, TG_API_HASH, TG_SESSION."
+        )
+    elif not _api_id_raw.isdigit():
+        _problems.append("TG_API_ID должен быть числом.")
+    elif TelegramClient is None:
+        _problems.append("Не установлена библиотека telethon (добавьте её в requirements.txt).")
+    else:
+        TG_API_ID = int(_api_id_raw)
+        ACCOUNT_MODE = True
+
 if _problems:
     for problem in _problems:
         log.error(problem)
@@ -100,6 +131,11 @@ DATA_FILE = "/tmp/bot_data.json"  # запасной вариант, на Render
 DEFAULT_INTERVAL_MIN = 30
 MIN_INTERVAL_MIN = 10
 MAX_INTERVAL_MIN = 1440
+# От аккаунта: интервал от 10 минут и короткие случайные паузы между группами.
+# При первом же лимите Telegram публикация останавливается (см. account_publish).
+ACCOUNT_MIN_INTERVAL_MIN = 10
+ACCOUNT_PAUSE = (5, 12)  # случайная пауза между группами, секунды
+ACCOUNT_SAFE_INTERVAL_MIN = 60  # ниже этого значения бот предупреждает о риске
 MAX_POST_LEN = 4096
 PAUSE_BETWEEN_GROUPS = 2
 CHECK_EVERY = 60
@@ -107,6 +143,15 @@ ANON_ADMIN_ID = 1087968824  # GroupAnonymousBot
 GROUP_TYPES = ("group", "supergroup")
 
 START_TS = time.time()
+
+
+def min_interval():
+    return ACCOUNT_MIN_INTERVAL_MIN if ACCOUNT_MODE else MIN_INTERVAL_MIN
+
+
+def default_interval():
+    return max(DEFAULT_INTERVAL_MIN, min_interval())
+
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -118,6 +163,207 @@ remote_loaded = not USE_REMOTE
 storage_error = ""
 publish_lock = asyncio.Lock()
 save_lock = asyncio.Lock()
+account_lock = asyncio.Lock()
+account_id = None
+
+
+# ---------------------------------------------------------------------------
+# Отдельный пользовательский аккаунт (необязательный режим)
+# ---------------------------------------------------------------------------
+
+class AccountSession:
+    """Короткое подключение к аккаунту: открыли, сделали дело, закрыли.
+
+    Так сессия не висит в Telegram постоянно, и перезапуск Render не мешает ей.
+    """
+
+    client = None
+
+    async def __aenter__(self):
+        await account_lock.acquire()
+        try:
+            self.client = TelegramClient(
+                StringSession(TG_SESSION), TG_API_ID, TG_API_HASH, receive_updates=False
+            )
+            await self.client.connect()
+            if not await self.client.is_user_authorized():
+                raise RuntimeError(
+                    "сессия аккаунта недействительна: создайте новую строку TG_SESSION"
+                )
+            return self.client
+        except BaseException:
+            await self._close()
+            account_lock.release()
+            raise
+
+    async def _close(self):
+        if self.client is not None:
+            try:
+                await self.client.disconnect()
+            except Exception:
+                log.exception("Не удалось закрыть подключение аккаунта")
+
+    async def __aexit__(self, *exc_info):
+        try:
+            await self._close()
+        finally:
+            account_lock.release()
+        return False
+
+
+STOP_ERRORS = {"FloodWaitError", "PeerFloodError"}
+AUTH_ERRORS = {
+    "AuthKeyUnregisteredError", "AuthKeyDuplicatedError", "SessionRevokedError",
+    "SessionExpiredError", "UserDeactivatedError", "UserDeactivatedBanError",
+}
+NO_FORWARD_ERRORS = {"ChatForwardsRestrictedError", "MessageIdInvalidError"}
+NO_WRITE_ERRORS = {
+    "ChatWriteForbiddenError", "UserBannedInChannelError", "ChatRestrictedError",
+    "ChatAdminRequiredError", "ChannelBannedError",
+}
+GONE_ERRORS = {"ChannelPrivateError", "ChatIdInvalidError", "PeerIdInvalidError", "ChannelInvalidError"}
+
+
+def classify_account_error(exc):
+    """Возвращает (статус, пояснение): failed / removed / stop."""
+    name = type(exc).__name__
+    if name == "FloodWaitError":
+        seconds = getattr(exc, "seconds", 0)
+        return "stop", f"Telegram просит подождать {fmt_duration(seconds)} (лимит); публикация остановлена"
+    if name == "PeerFloodError":
+        return "stop", "Telegram ограничил аккаунт за рассылку; публикация остановлена, проверьте @SpamBot"
+    if name in AUTH_ERRORS:
+        return "stop", "аккаунт разлогинен или заблокирован; нужна новая строка TG_SESSION"
+    if name == "SlowModeWaitError":
+        return "failed", f"в группе включён медленный режим, подождать {fmt_duration(getattr(exc, 'seconds', 0))}"
+    if name in NO_FORWARD_ERRORS:
+        return "failed", "пересылка запрещена (защита от копирования) или пост недоступен; задайте /setpost заново"
+    if name in NO_WRITE_ERRORS:
+        return "failed", "аккаунту запрещено писать в этой группе"
+    if name in GONE_ERRORS:
+        return "removed", "аккаунт больше не состоит в этой группе"
+    return "failed", f"{name}: {exc}"
+
+
+async def get_account_id():
+    global account_id
+    if account_id is None:
+        async with AccountSession() as client:
+            me = await client.get_me()
+            if getattr(me, "bot", False):
+                raise RuntimeError("TG_SESSION принадлежит боту, нужен обычный аккаунт")
+            account_id = me.id
+    return account_id
+
+
+async def account_publish(keys, result):
+    """Публикация от аккаунта. Заполняет result; при лимитах останавливается."""
+    try:
+        async with AccountSession() as client:
+            await client.get_dialogs()
+            msg = None
+            forward = False
+            if state["post_source"]:
+                source = state["ub_source"]
+                if not source:
+                    result["stopped"] = (
+                        "пост не передан аккаунту: отправьте боту пост и снова ответьте на него /setpost"
+                    )
+                    return
+                me = await bot.me()
+                msg = await client.get_messages(me.username, ids=source["message_id"])
+                if not msg:
+                    result["stopped"] = (
+                        "пост не найден в чате аккаунта с ботом (его удалили?); задайте /setpost заново"
+                    )
+                    return
+                forward = True
+            for index, key in enumerate(keys):
+                title = group_title(key)
+                try:
+                    entity = await client.get_entity(int(key))
+                    if forward:
+                        await client.forward_messages(entity, msg)
+                    else:
+                        await client.send_message(entity, state["post_text"])
+                    result["ok"] += 1
+                except Exception as exc:
+                    status, detail = classify_account_error(exc)
+                    if status == "stop":
+                        result["failed"].append((title, detail))
+                        result["stopped"] = detail
+                        result["not_tried"] = len(keys) - index - 1
+                        return
+                    if status == "removed":
+                        state["groups"].pop(key, None)
+                        result["removed"].append((title, detail))
+                    else:
+                        result["failed"].append((title, detail))
+                if index < len(keys) - 1:
+                    await asyncio.sleep(random.uniform(*ACCOUNT_PAUSE))
+    except Exception as exc:
+        log.exception("Ошибка публикации от аккаунта")
+        status, detail = classify_account_error(exc)
+        result["stopped"] = result["stopped"] or detail
+
+
+async def account_resolve(client, kind, value):
+    """Проверяет группу глазами аккаунта. Возвращает (статус, название, пояснение)."""
+    label = f"@{value}" if kind == "user" else str(value)
+    try:
+        if kind == "private":
+            invite = value.split("/")[-1].lstrip("+")
+            info = await client(CheckChatInviteRequest(invite))
+            if not isinstance(info, ChatInviteAlready):
+                return "failed", label, "аккаунт не состоит в этой группе: вступите в неё вручную"
+            entity = info.chat
+        else:
+            entity = await client.get_entity(f"@{value}" if kind == "user" else value)
+        return await account_check_entity(client, entity, label)
+    except Exception as exc:
+        name = type(exc).__name__
+        if name in ("UsernameNotOccupiedError", "UsernameInvalidError", "InviteHashInvalidError", "InviteHashExpiredError"):
+            return "failed", label, "группа или ссылка не найдена"
+        log.exception("Не удалось проверить группу %s", label)
+        return "failed", label, f"{name}: {exc}"
+
+
+async def account_check_entity(client, entity, label):
+    """Проверяет, что аккаунт состоит в группе и может писать; добавляет её в список."""
+    if type(entity).__name__ not in ("Channel", "Chat"):
+        return "failed", label, "это не группа и не канал"
+    perms = await client.get_permissions(entity)
+    if perms is None:
+        return "failed", label, "аккаунт не состоит в этой группе: вступите в неё вручную"
+    if not perms.send_messages:
+        return "failed", label, "аккаунту запрещено писать в этой группе"
+    key = str(tl_utils.get_peer_id(entity))
+    title = getattr(entity, "title", None) or label
+    if key in state["groups"]:
+        state["groups"][key]["title"] = title
+        return "exists", title, ""
+    state["groups"][key] = {"title": title}
+    return "added", title, ""
+
+
+def folder_title(folder):
+    title = getattr(folder, "title", None)
+    return str(getattr(title, "text", title) or "").strip()
+
+
+async def account_folders(client):
+    """Папки чатов аккаунта: список (название, include_peers)."""
+    from telethon.tl.functions.messages import GetDialogFiltersRequest
+
+    res = await client(GetDialogFiltersRequest())
+    filters = getattr(res, "filters", res)
+    folders = []
+    for item in filters:
+        name = folder_title(item)
+        peers = list(getattr(item, "include_peers", None) or [])
+        if name and peers:
+            folders.append((name, peers))
+    return folders
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +375,9 @@ def default_state():
         "groups": {},  # "chat_id" -> {"title": "..."}
         "post_text": "",
         "post_source": None,  # {"chat_id": ..., "message_id": ...} - сообщение для пересылки
+        "ub_source": None,  # {"message_id": ...} - копия поста в чате аккаунта с ботом
         "autopost_enabled": False,
-        "interval_min": DEFAULT_INTERVAL_MIN,
+        "interval_min": default_interval(),
         "last_post_ts": 0.0,
         "last_report": "",
     }
@@ -158,12 +405,18 @@ def apply_loaded(data):
             }
         except (KeyError, TypeError, ValueError):
             new["post_source"] = None
+    ub_source = data.get("ub_source")
+    if isinstance(ub_source, dict):
+        try:
+            new["ub_source"] = {"message_id": int(ub_source["message_id"])}
+        except (KeyError, TypeError, ValueError):
+            new["ub_source"] = None
     new["autopost_enabled"] = bool(data.get("autopost_enabled", False))
     try:
-        interval = int(data.get("interval_min", DEFAULT_INTERVAL_MIN))
+        interval = int(data.get("interval_min", default_interval()))
     except (TypeError, ValueError):
-        interval = DEFAULT_INTERVAL_MIN
-    new["interval_min"] = min(max(interval, MIN_INTERVAL_MIN), MAX_INTERVAL_MIN)
+        interval = default_interval()
+    new["interval_min"] = min(max(interval, min_interval()), MAX_INTERVAL_MIN)
     try:
         new["last_post_ts"] = float(data.get("last_post_ts", 0) or 0)
     except (TypeError, ValueError):
@@ -398,19 +651,24 @@ async def publish_to_groups(source, late_min=0):
     """Публикует текст во все группы. Возвращает словарь с итогами."""
     async with publish_lock:
         keys = list(state["groups"])
-        result = {"ok": 0, "total": len(keys), "failed": [], "removed": []}
-        for index, key in enumerate(keys):
-            title = group_title(key)
-            status, detail = await send_one(int(key))
-            if status == "ok":
-                result["ok"] += 1
-            elif status == "removed":
-                result["removed"].append((title, detail))
-            else:
-                result["failed"].append((title, detail))
-            if index < len(keys) - 1:
-                await asyncio.sleep(PAUSE_BETWEEN_GROUPS)
+        result = {"ok": 0, "total": len(keys), "failed": [], "removed": [], "stopped": "", "not_tried": 0}
+        if ACCOUNT_MODE:
+            await account_publish(keys, result)
+        else:
+            for index, key in enumerate(keys):
+                title = group_title(key)
+                status, detail = await send_one(int(key))
+                if status == "ok":
+                    result["ok"] += 1
+                elif status == "removed":
+                    result["removed"].append((title, detail))
+                else:
+                    result["failed"].append((title, detail))
+                if index < len(keys) - 1:
+                    await asyncio.sleep(PAUSE_BETWEEN_GROUPS)
 
+        if result["stopped"]:
+            state["autopost_enabled"] = False
         state["last_post_ts"] = time.time()
         report = f"{source}: {format_result(result)}"
         if late_min:
@@ -429,6 +687,11 @@ def format_result(result):
             f"🗑 {title}: {detail}. Группа убрана из списка; после исправления "
             "добавьте её снова командой /addhere."
         )
+    if result.get("stopped"):
+        text = f"⛔ Публикация остановлена: {result['stopped']}. Автопубликация выключена."
+        if result.get("not_tried"):
+            text += f" Не отправлено в группы: {result['not_tried']}."
+        lines.append(text)
     return "\n".join(lines)
 
 
@@ -445,7 +708,7 @@ async def run_autopost():
     late_min = int(late // 60) if late > 300 else 0
     log.info("Плановая публикация начата")
     result = await publish_to_groups("авто", late_min)
-    if result["failed"] or result["removed"]:
+    if result["failed"] or result["removed"] or result["stopped"]:
         await notify_owner("⚠️ Автопубликация завершилась с проблемами.\n" + format_result(result))
     if not state["groups"]:
         state["autopost_enabled"] = False
@@ -481,6 +744,7 @@ HELP_TEXT = (
     "Группы добавляются сами, когда вы добавляете бота в группу. Ещё способы:\n"
     "/addhere - добавить группу (отправить в самой группе)\n"
     "/addgroups список - проверить и добавить сразу много групп (@имена и ссылки t.me)\n"
+    "/addfolder Название - (режим аккаунта) добавить группы из папки чатов аккаунта\n"
     "/groups - список групп\n"
     "/removegroup N - убрать группу (N из /groups)\n"
     "/publish - опубликовать сейчас\n"
@@ -512,7 +776,27 @@ async def set_post(message: types.Message, command: CommandObject):
     text = (command.args or "").strip()
     reply = message.reply_to_message
     if reply is not None and not text:
+        ub_source = None
+        if ACCOUNT_MODE:
+            # Бот пересылает пост аккаунту, а аккаунт пересылает его дальше в группы.
+            try:
+                target = await get_account_id()
+                forwarded = await bot.forward_message(
+                    chat_id=target, from_chat_id=reply.chat.id, message_id=reply.message_id
+                )
+                ub_source = {"message_id": forwarded.message_id}
+            except TelegramForbiddenError:
+                await message.answer(
+                    "Аккаунт ещё не открывал чат с ботом. Зайдите с аккаунта в Telegram, "
+                    "найдите этого бота, нажмите Start и повторите /setpost."
+                )
+                return
+            except Exception as exc:
+                log.exception("Не удалось передать пост аккаунту")
+                await message.answer(f"Не удалось передать пост аккаунту: {exc}")
+                return
         state["post_source"] = {"chat_id": reply.chat.id, "message_id": reply.message_id}
+        state["ub_source"] = ub_source
         state["post_text"] = ""
         ok = await save_state()
         await message.answer(
@@ -535,6 +819,7 @@ async def set_post(message: types.Message, command: CommandObject):
         return
     state["post_text"] = text
     state["post_source"] = None
+    state["ub_source"] = None
     ok = await save_state()
     await message.answer(f"Текст публикации сохранён ({len(text)} символов)." + save_note(ok))
 
@@ -674,15 +959,21 @@ async def set_interval(message: types.Message, command: CommandObject):
     if not await guard(message):
         return
     arg = (command.args or "").strip()
-    if not re.fullmatch(r"\d{1,5}", arg) or not (MIN_INTERVAL_MIN <= int(arg) <= MAX_INTERVAL_MIN):
+    if not re.fullmatch(r"\d{1,5}", arg) or not (min_interval() <= int(arg) <= MAX_INTERVAL_MIN):
+        extra = ""
         await message.answer(
-            f"Использование: /setinterval минуты (от {MIN_INTERVAL_MIN} до {MAX_INTERVAL_MIN}). "
-            f"Сейчас: {state['interval_min']} мин."
+            f"Использование: /setinterval минуты (от {min_interval()} до {MAX_INTERVAL_MIN}). "
+            f"Сейчас: {state['interval_min']} мин." + extra
         )
         return
     state["interval_min"] = int(arg)
     ok = await save_state()
     text = f"Интервал: {state['interval_min']} мин."
+    if ACCOUNT_MODE and state["interval_min"] < ACCOUNT_SAFE_INTERVAL_MIN:
+        text += (
+            "\n⚠️ Такой частый повтор одного сообщения повышает риск, что Telegram ограничит или "
+            "заблокирует аккаунт. Если придёт лимит, бот остановит публикацию и сообщит вам."
+        )
     if state["autopost_enabled"]:
         wait = next_due_ts() - time.time()
         if wait > 0:
@@ -707,6 +998,13 @@ def status_text():
         )
     if storage_error:
         lines.append(f"Ошибка хранилища: {storage_error}")
+    if ACCOUNT_MODE:
+        lines.append(
+            f"Режим: пересылка от аккаунта (интервал не меньше {min_interval()} мин, "
+            "паузы между группами, остановка при лимитах Telegram)"
+        )
+    else:
+        lines.append("Режим: публикация от имени бота")
     lines.append(f"Групп: {len(state['groups'])}")
     lines.append(f"Пост: {post_description()}")
     if state["autopost_enabled"]:
@@ -820,22 +1118,39 @@ async def add_groups(message: types.Message, command: CommandObject):
     refs = refs[:MAX_BULK]
     await message.answer(f"Проверяю групп: {len(refs)}.")
     added, existing, failed = [], [], []
-    for kind, value in refs:
-        if kind == "private":
-            failed.append((
-                value,
-                "закрытая ссылка-приглашение: бот не может вступить сам. Добавьте бота в группу "
-                "вручную, она зарегистрируется автоматически",
-            ))
-            continue
-        status, title, detail = await resolve_group(kind, value)
-        if status == "added":
-            added.append(title)
-        elif status == "exists":
-            existing.append(title)
-        else:
-            failed.append((title, detail))
-        await asyncio.sleep(0.3)
+
+    async def run_all(resolve):
+        for kind, value in refs:
+            if kind == "private" and not ACCOUNT_MODE:
+                failed.append((
+                    value,
+                    "закрытая ссылка-приглашение: бот не может вступить сам. Добавьте бота в группу "
+                    "вручную, она зарегистрируется автоматически",
+                ))
+                continue
+            status, title, detail = await resolve(kind, value)
+            if status == "added":
+                added.append(title)
+            elif status == "exists":
+                existing.append(title)
+            else:
+                failed.append((title, detail))
+            await asyncio.sleep(0.3)
+
+    if ACCOUNT_MODE:
+        try:
+            async with AccountSession() as client:
+                await client.get_dialogs()
+
+                async def resolver(kind, value):
+                    return await account_resolve(client, kind, value)
+
+                await run_all(resolver)
+        except Exception as exc:
+            log.exception("Ошибка проверки групп через аккаунт")
+            failed.append(("аккаунт", classify_account_error(exc)[1]))
+    else:
+        await run_all(resolve_group)
     ok = await save_state()
 
     lines = []
@@ -848,6 +1163,63 @@ async def add_groups(message: types.Message, command: CommandObject):
     if skipped:
         lines.append(f"Пропущено из-за лимита {MAX_BULK} за раз: {skipped}. Отправьте их отдельной командой.")
     await message.answer("\n".join(lines) + save_note(ok))
+
+
+@dp.message(Command("addfolder"))
+async def add_folder(message: types.Message, command: CommandObject):
+    if not await guard(message):
+        return
+    if not ACCOUNT_MODE:
+        await message.answer("Импорт папки работает только в режиме публикации от аккаунта.")
+        return
+    wanted = (command.args or "").strip().lower()
+    added, existing, failed = [], [], []
+    try:
+        async with AccountSession() as client:
+            await client.get_dialogs()
+            folders = await account_folders(client)
+            if not wanted:
+                names = ", ".join(f"«{name}» ({len(peers)})" for name, peers in folders) or "папок нет"
+                await message.answer(
+                    "Папки аккаунта: " + names + "\nИмпорт: /addfolder Название папки"
+                )
+                return
+            match = [item for item in folders if item[0].lower() == wanted]
+            if not match:
+                await message.answer("Папка с таким названием не найдена. Список: /addfolder")
+                return
+            peers = match[0][1][:MAX_BULK]
+            skipped = len(match[0][1]) - len(peers)
+            for peer in peers:
+                try:
+                    entity = await client.get_entity(peer)
+                except Exception as exc:
+                    failed.append((str(peer), classify_account_error(exc)[1]))
+                    continue
+                label = getattr(entity, "title", None) or str(peer)
+                status, title, detail = await account_check_entity(client, entity, label)
+                if status == "added":
+                    added.append(title)
+                elif status == "exists":
+                    existing.append(title)
+                else:
+                    failed.append((title, detail))
+                await asyncio.sleep(0.3)
+    except Exception as exc:
+        log.exception("Ошибка импорта папки")
+        await message.answer("Не удалось прочитать папки аккаунта: " + classify_account_error(exc)[1])
+        return
+    ok = await save_state()
+    lines = []
+    if added:
+        lines.append("✅ Добавлено: " + ", ".join(added))
+    if existing:
+        lines.append("➖ Уже в списке: " + ", ".join(existing))
+    for title, detail in failed:
+        lines.append(f"❌ {title}: {detail}")
+    if skipped:
+        lines.append(f"Пропущено из-за лимита {MAX_BULK} за раз: {skipped}.")
+    await message.answer("\n".join(lines or ["В папке нет подходящих групп."]) + save_note(ok))
 
 
 # ---------------------------------------------------------------------------
