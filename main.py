@@ -478,7 +478,9 @@ HELP_TEXT = (
     "/setpost - ответьте этой командой на готовое сообщение, и я буду пересылать его в группы\n"
     "/setpost Текст - или задайте обычный текст\n"
     "/showpost - показать текущий пост\n"
+    "Группы добавляются сами, когда вы добавляете бота в группу. Ещё способы:\n"
     "/addhere - добавить группу (отправить в самой группе)\n"
+    "/addgroups список - проверить и добавить сразу много групп (@имена и ссылки t.me)\n"
     "/groups - список групп\n"
     "/removegroup N - убрать группу (N из /groups)\n"
     "/publish - опубликовать сейчас\n"
@@ -735,6 +737,119 @@ async def status(message: types.Message):
     await message.answer(status_text())
 
 
+MAX_BULK = 30
+
+REF_RE = re.compile(
+    r"(?:https?://)?(?:t|telegram)\.me/(\+[A-Za-z0-9_-]+|joinchat/[A-Za-z0-9_-]+|[A-Za-z][A-Za-z0-9_]{3,31})"
+    r"|@([A-Za-z][A-Za-z0-9_]{3,31})"
+    r"|(?<![0-9])(-100[0-9]{5,})"
+)
+
+
+def parse_group_refs(text):
+    """Достаёт из текста ссылки t.me, @имена и числовые id. Без повторов."""
+    refs = []
+    seen = set()
+    for found in REF_RE.finditer(text or ""):
+        link, username, chat_id = found.groups()
+        if link:
+            if link.startswith("+") or link.startswith("joinchat/"):
+                ref = ("private", link)
+            else:
+                ref = ("user", link)
+        elif username:
+            ref = ("user", username)
+        else:
+            ref = ("id", int(chat_id))
+        marker = (ref[0], str(ref[1]).lower())
+        if marker not in seen:
+            seen.add(marker)
+            refs.append(ref)
+    return refs
+
+
+NOT_THERE = "бота в этой группе нет - добавьте его в группу вручную"
+
+
+async def resolve_group(kind, value):
+    """Проверяет группу и добавляет в список. Возвращает (статус, название, пояснение)."""
+    target = f"@{value}" if kind == "user" else value
+    label = target if kind == "user" else str(value)
+    try:
+        chat = await bot.get_chat(target)
+        if chat.type not in GROUP_TYPES:
+            return "failed", label, "это не группа (канал или личный чат)"
+        member = await bot.get_chat_member(chat.id, bot.id)
+    except TelegramForbiddenError:
+        return "failed", label, NOT_THERE
+    except TelegramBadRequest as exc:
+        if "not found" in (exc.message or "").lower():
+            return "failed", label, "группа не найдена, закрытая, или бота в ней нет - добавьте бота вручную"
+        return "failed", label, f"ошибка Telegram: {exc.message}"
+    except Exception as exc:
+        log.exception("Не удалось проверить группу %s", label)
+        return "failed", label, describe_error(exc)
+
+    if member.status in ("left", "kicked"):
+        return "failed", label, NOT_THERE
+    if member.status == "restricted" and not getattr(member, "can_send_messages", True):
+        return "failed", label, "боту запрещено писать в этой группе"
+    key = str(chat.id)
+    title = chat.title or label
+    if key in state["groups"]:
+        state["groups"][key]["title"] = title
+        return "exists", title, ""
+    state["groups"][key] = {"title": title}
+    return "added", title, ""
+
+
+@dp.message(Command("addgroups"))
+async def add_groups(message: types.Message, command: CommandObject):
+    if not await guard(message):
+        return
+    refs = parse_group_refs(command.args or "")
+    if not refs:
+        await message.answer(
+            "Пришлите список после команды, например:\n"
+            "/addgroups @group_one https://t.me/group_two\n"
+            "Подойдут ссылки t.me, @имена публичных групп и номера вида -100...\n"
+            "Бот уже должен быть в этих группах: сам вступить он не может."
+        )
+        return
+    skipped = max(len(refs) - MAX_BULK, 0)
+    refs = refs[:MAX_BULK]
+    await message.answer(f"Проверяю групп: {len(refs)}.")
+    added, existing, failed = [], [], []
+    for kind, value in refs:
+        if kind == "private":
+            failed.append((
+                value,
+                "закрытая ссылка-приглашение: бот не может вступить сам. Добавьте бота в группу "
+                "вручную, она зарегистрируется автоматически",
+            ))
+            continue
+        status, title, detail = await resolve_group(kind, value)
+        if status == "added":
+            added.append(title)
+        elif status == "exists":
+            existing.append(title)
+        else:
+            failed.append((title, detail))
+        await asyncio.sleep(0.3)
+    ok = await save_state()
+
+    lines = []
+    if added:
+        lines.append("✅ Добавлено: " + ", ".join(added))
+    if existing:
+        lines.append("➖ Уже в списке: " + ", ".join(existing))
+    for title, detail in failed:
+        lines.append(f"❌ {title}: {detail}")
+    if skipped:
+        lines.append(f"Пропущено из-за лимита {MAX_BULK} за раз: {skipped}. Отправьте их отдельной командой.")
+    await message.answer("\n".join(lines) + save_note(ok))
+
+
 # ---------------------------------------------------------------------------
 # События чатов: удаление бота, смена id группы
 # ---------------------------------------------------------------------------
@@ -765,6 +880,21 @@ async def on_my_chat_member(event: types.ChatMemberUpdated):
             await notify_owner(
                 f"⚠️ В группе «{title}» боту запретили писать сообщения. "
                 "Публикация туда не пройдёт, пока права не вернут."
+            )
+    elif new_status in ("member", "administrator") and event.from_user.id == OWNER_ID:
+        # Бота в группу добавили вы - регистрируем группу автоматически.
+        if not await ensure_loaded():
+            await notify_owner(
+                f"⚠️ Вы добавили бота в группу «{title}», но хранилище недоступно. "
+                "Позже отправьте в этой группе /addhere."
+            )
+            return
+        if key not in state["groups"]:
+            state["groups"][key] = {"title": title}
+            ok = await save_state()
+            await notify_owner(
+                f"✅ Группа «{title}» добавлена в список автоматически (бота добавили вы). "
+                "Убедитесь, что у бота есть право писать сообщения." + save_note(ok)
             )
 
 
